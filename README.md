@@ -14,6 +14,10 @@ The service provider registers `thorvg` on Topside's rasterization and painting 
 - **Anti-aliased shapes and gradients** (painting): `path`, `gradpath`, `polyline`, `ellipse`, `ring`, `roundrect` and `roundring` commands.
 - **Everything else comes from VelvetGE:** hard edges, clears, shadows, glass, layers, images, glyphs and spans.
 
+## Images
+
+`thorvg` on Images reads PNG and JPEG. A picture is drawn at its natural size onto a software canvas aimed at the frame, in a straight colorspace. An opaque pixel matches the file. A partial pixel can be 1 off, because ThorVG premultiplies and the straight target divides that back out. The draw replaces the frame: it does not blend into the pixels that were there. WebP is a loader this build has; a flat `0x102030` stored at quality 100 came back `0x301522`, so WebP is not claimed. SVG has no fixed pixel size.
+
 ## Where it draws
 
 - **In place**, straight into the framebuffer's memory, when that memory is 32-bit rows in the order B G R A or R G B A, top row first. This holds for a frame with any transparency: ThorVG's premultiplied source-over on the stored bytes is the same arithmetic as VelvetGE's blend.

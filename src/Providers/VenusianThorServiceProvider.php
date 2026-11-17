@@ -3,6 +3,7 @@
 namespace Jovian\Rendering\Thor\Providers;
 
 use Jovian\Rendering\Thor\Framebuffers\ThorVGFramebufferDriver;
+use Jovian\Rendering\Thor\Images\ThorImageDecoderDriver;
 use Jovian\Rendering\Thor\ThorVGPaintingDriver;
 use Jovian\Rendering\Thor\ThorVGRasterizationDriver;
 use Jovian\Rendering\Thor\Stroking\ThorVGStrokingDriver;
@@ -27,6 +28,7 @@ class VenusianThorServiceProvider extends ServiceProvider
         $this->registerVelvetRasterizationDriver();
         $this->registerVelvetPaintbrushDriver();
         $this->registerStrokingDriver();
+        $this->registerImageDecoder();
     }
 
     /** 'thorvg' on Velvet's rasterizers. */
@@ -52,6 +54,15 @@ class VenusianThorServiceProvider extends ServiceProvider
      *
      * @throws ReflectionException
      */
+    /** 'thorvg' on Images' decoders. PNG and JPEG, drawn straight into the frame at its own size. */
+    protected function registerImageDecoder(): void
+    {
+        if (! extension_loaded('thorvg')) {
+            return;
+        }
+        app('images.decoders')->extend('thorvg', fn () => new ThorImageDecoderDriver());
+    }
+
     protected function registerStrokingDriver(): void
     {
         app('strokers')->extend('thorvg', fn () => new ThorVGStrokingDriver());
