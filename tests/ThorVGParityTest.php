@@ -3,8 +3,8 @@
 declare(strict_types=1);
 
 /*
- * Runs inside venusian/topside's test suite (it uses topside's SpanGrid): copy this file into
- * topside's tests/Rasterization/ in a workbench with this package autoloaded. See AGENTS.md.
+ * Runs inside jovian/venusian-velvet's test suite (it uses topside's SpanGrid and Lustrous's
+ * PHP scanner as the reference): copy it into that package's tests/ with this package autoloaded.
  */
 
 use Jovian\Rendering\Thor\ThorVGRasterizationDriver;
@@ -14,8 +14,8 @@ use Surface\Contracts\Rendering\Framebuffers\Spans;
 use Surface\Contracts\Rendering\Rasterization\Edges;
 use Surface\Contracts\Rendering\Rasterization\FillRule;
 use Surface\Contracts\Rendering\Rasterization\Rasterizer;
-use Surface\VelvetGE\Rasterize\PHPLandScanner;
-use Surface\VelvetGE\Rasterize\ScannerRasterizer;
+use Jovian\Engines\Velvet\Lustrous\Rasterization\PHPLandScanner;
+use VelvetGE\Rasterization\ScannerRasterizer;
 use Venusian\Topside\Tests\Support\Rasterization\SpanGrid;
 
 /** The same shape through ThorVG and through VelvetGE's PHP scanner, $n times with random arguments. */
@@ -98,14 +98,100 @@ it('matches exactly where the shape is exact: whole pixels, both fill rules', fu
     }
 });
 
-it('leaves hard edges and curves to VelvetGE, byte for byte', function (Closure $shape, Edges $edges): void {
-    foreach (thor_pairs($shape, 20, $edges) as [$a, $b]) {
-        expect($a)->toBe($b);
+/** Each curved shape with random arguments, as one closure per kind. */
+function thor_curves(): array
+{
+    $radii = fn (): array => [mt_rand(0, 2000) / 100, mt_rand(0, 2000) / 100, mt_rand(0, 2000) / 100, mt_rand(0, 2000) / 100];
+
+    return [
+        'ellipse' => fn (Rasterizer $z) => $z->fillEllipse(thor_r(), thor_r(), 1 + thor_r() / 4, 1 + thor_r() / 4),
+        'ring' => fn (Rasterizer $z) => $z->strokeEllipse(thor_r(), thor_r(), 2 + thor_r() / 4, 2 + thor_r() / 4, 1 + mt_rand(0, 800) / 100),
+        'roundrect' => fn (Rasterizer $z) => $z->fillRoundRect(thor_r() / 2, thor_r() / 2, 4 + thor_r() / 2, 4 + thor_r() / 2, $radii()),
+        'roundring' => fn (Rasterizer $z) => $z->strokeRoundRect(thor_r() / 2, thor_r() / 2, 6 + thor_r() / 2, 6 + thor_r() / 2, $radii(), 1 + mt_rand(0, 600) / 100),
+    ];
+}
+
+/*
+ * Curves are ThorVG geometry (tvg_shape_append_circle, and round corners as its cubics), not
+ * VelvetGE's outline. Measured 2026-11-15 over 200 of each against VelvetGE's PHP scanner: the
+ * worst pixel 40 (ellipse), 44 (ring), 39 (round rect), 39 (round ring); total coverage within
+ * 0.4% for every kind. Nothing was tuned toward VelvetGE.
+ */
+it('fills curves as ThorVG geometry, at its measured distance from VelvetGE', function (string $kind, int $worst): void {
+    [$most, $a, $b] = [0, 0, 0];
+    foreach (thor_pairs(thor_curves()[$kind], 200) as [$thor, $velvet]) {
+        $t = thor_cells($thor);
+        $v = thor_cells($velvet);
+        foreach ($t + $v as $k => $_) {
+            $most = max($most, abs(($t[$k] ?? 0) - ($v[$k] ?? 0)));
+        }
+        [$a, $b] = [$a + array_sum($t), $b + array_sum($v)];
     }
-})->with([
-    'hard polygon' => [fn (Rasterizer $z) => $z->fillTriangle(thor_r(), thor_r(), thor_r(), thor_r(), thor_r(), thor_r()), Edges::HARD],
-    'antialiased ellipse' => [fn (Rasterizer $z) => $z->fillEllipse(thor_r(), thor_r(), 1 + thor_r() / 4, 1 + thor_r() / 4), Edges::ANTIALIASED],
-]);
+    expect($most)->toBeLessThanOrEqual($worst)
+        ->and(abs($a / $b - 1))->toBeLessThan(0.004);
+})->with([['ellipse', 40], ['ring', 44], ['roundrect', 39], ['roundring', 39]]);
+
+/** Pixel => coverage. */
+function thor_cells(string $spans): array
+{
+    $g = [];
+    foreach (Spans::unpack($spans) as [$y, $x, $length, $coverage]) {
+        for ($i = 0; $i < $length; $i++) {
+            $g[$y * 65536 + $x + $i] = $coverage;
+        }
+    }
+
+    return $g;
+}
+
+/*
+ * Hard edges are ThorVG's own (its aliased option), measured 2026-11-15 over 200 random
+ * triangles: every pixel is 0 or 255; every pixel VelvetGE's hard scanner fills, ThorVG fills
+ * too; every pixel at least half covered is filled; ThorVG adds edge pixels VelvetGE leaves out,
+ * 6.1% of all filled pixels (a sliver's share can reach 60%). Nothing was tuned toward VelvetGE.
+ */
+it('fills hard edges its own way: whole pixels, a superset of VelvetGE\'s, nothing half covered missed', function (): void {
+    $clip = new Region(0, 0, 200, 150);
+    $smooth = new ScannerRasterizer('native', fn ($c, $e) => new PHPLandScanner($c, $e), $clip, Edges::ANTIALIASED);
+    $extra = $all = 0;
+    foreach (thor_pairs(fn (Rasterizer $z) => $z->fillTriangle(thor_r(), thor_r(), thor_r(), thor_r(), thor_r(), thor_r()), 200, Edges::HARD) as $n => [$a, $b]) {
+        $t = thor_cells($a);
+        $v = thor_cells($b);
+        expect(array_unique(array_values($t)) ?: [255])->toBe([255])
+            ->and(array_diff_key($v, $t))->toBe([]);
+        mt_srand(1000 + $n);
+        foreach (thor_cells($smooth->fillTriangle(thor_r(), thor_r(), thor_r(), thor_r(), thor_r(), thor_r())) as $k => $coverage) {
+            if ($coverage >= 128) {
+                expect(isset($t[$k]))->toBeTrue();
+            }
+        }
+        $extra += count(array_diff_key($t, $v));
+        $all += count($t);
+    }
+    expect($extra / $all)->toBeLessThan(0.07);
+});
+
+/*
+ * The same holds for curves (measured 2026-11-15, 200 of each): whole pixels, every pixel
+ * VelvetGE's hard scanner fills, every pixel at least half covered. ThorVG's extra edge pixels
+ * weigh most on thin bands: a ring's or round ring's hard area is about 1.25 of VelvetGE's.
+ */
+it('fills hard curves its own way: whole pixels, a superset of VelvetGE\'s, nothing half covered missed', function (string $kind): void {
+    $clip = new Region(0, 0, 200, 150);
+    $smooth = new ScannerRasterizer('native', fn ($c, $e) => new PHPLandScanner($c, $e), $clip, Edges::ANTIALIASED);
+    $shape = thor_curves()[$kind];
+    foreach (thor_pairs($shape, 200, Edges::HARD) as $n => [$a, $b]) {
+        $t = thor_cells($a);
+        expect(array_unique(array_values($t)) ?: [255])->toBe([255])
+            ->and(array_diff_key(thor_cells($b), $t))->toBe([]);
+        mt_srand(1000 + $n);
+        foreach (thor_cells($shape($smooth)) as $k => $coverage) {
+            if ($coverage >= 128) {
+                expect(isset($t[$k]))->toBeTrue();
+            }
+        }
+    }
+})->with(['ellipse', 'ring', 'roundrect', 'roundring']);
 
 it('answers nothing outside the clip, and spans across tiles in order', function (): void {
     $small = new ThorVGScanner(new Region(10, 10, 5, 5), Edges::ANTIALIASED);
@@ -117,7 +203,7 @@ it('answers nothing outside the clip, and spans across tiles in order', function
     expect(SpanGrid::area($spans))->toBe(27000.0);
 });
 
-it('answers the same coverage as a mask as it does as spans', function (): void {
+it('answers the same coverage as a mask as it does as spans, paths and curves', function (): void {
     $scanner = new ThorVGScanner(new Region(0, 0, 200, 150), Edges::ANTIALIASED);
     mt_srand(9);
     for ($i = 0; $i < 200; $i++) {
@@ -141,8 +227,17 @@ it('answers the same coverage as a mask as it does as spans', function (): void 
         }
         expect($grid)->toEqual($spans);
     }
-    expect($scanner->mask([\Surface\Contracts\Rendering\Rasterization\Scanner::ELLIPSE, 1, 1, 1, 1]))->toBeNull()
-        ->and($scanner->mask([\Surface\Contracts\Rendering\Rasterization\Scanner::PATH, [[500, 500, 510, 500, 510, 510]], 0]))->toBeNull();
+    foreach ([[40.3, 30.7, 25.1, 12.6], [150.5, 75.2, 60.0, 90.4]] as [$cx, $cy, $rx, $ry]) {
+        [$a8, $width, $left, $top] = $scanner->mask([\Surface\Contracts\Rendering\Rasterization\Scanner::ELLIPSE, $cx, $cy, $rx, $ry]);
+        $grid = [];
+        foreach (str_split($a8) as $k => $byte) {
+            if ($byte !== "\0") {
+                $grid[($top + intdiv($k, $width)) * 65536 + $left + $k % $width] = ord($byte);
+            }
+        }
+        expect($grid)->toEqual(thor_cells($scanner->ellipse($cx, $cy, $rx, $ry)));
+    }
+    expect($scanner->mask([\Surface\Contracts\Rendering\Rasterization\Scanner::PATH, [[500, 500, 510, 500, 510, 510]], 0]))->toBeNull();
 });
 
 it('is the thorvg driver', function (): void {
@@ -150,7 +245,7 @@ it('is the thorvg driver', function (): void {
 });
 
 it('draws in place where the memory is 32-bit B G R A or R G B A rows, and nowhere else', function (): void {
-    $memory = fn (\Surface\Contracts\Rendering\Framebuffers\FormatSpec $spec) => (new \Surface\VelvetGE\Drivers\Framebuffers\CLandFramebufferDriver())->full($spec, 8, 8)->memory();
+    $memory = fn (\Surface\Contracts\Rendering\Framebuffers\FormatSpec $spec) => (new \Jovian\Engines\Velvet\Lustrous\Framebuffers\CLandFramebufferDriver())->full($spec, 8, 8)->memory();
     $scanner = new ThorVGScanner(new Region(0, 0, 8, 8), Edges::ANTIALIASED);
     $order = fn (\Surface\Contracts\Rendering\Framebuffers\ChannelOrder $o) => new \Surface\Contracts\Rendering\Framebuffers\FormatSpec(\Surface\Contracts\Rendering\Framebuffers\PixelFormat::ROW_MAJOR, \Surface\Contracts\Rendering\Framebuffers\BitDepth::B32, channel_order: $o);
 
@@ -162,7 +257,7 @@ it('draws in place where the memory is 32-bit B G R A or R G B A rows, and nowhe
 })->skip(! extension_loaded('fb'), 'ext-fb is not loaded: no store with memory to draw into.');
 
 it('blends in place within BLEND of VelvetGE blending the same coverage, over pixels of every alpha', function (\Surface\Contracts\Rendering\Framebuffers\FormatSpec $spec): void {
-    $frames = new \Surface\VelvetGE\Drivers\Framebuffers\CLandFramebufferDriver();
+    $frames = new \Jovian\Engines\Velvet\Lustrous\Framebuffers\CLandFramebufferDriver();
     $clip = new Region(3, 2, 58, 44);
     $thor = (new ThorVGRasterizationDriver())->rasterizer($clip, Edges::ANTIALIASED);
     mt_srand(21);

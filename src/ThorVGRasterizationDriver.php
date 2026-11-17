@@ -2,19 +2,15 @@
 
 namespace Jovian\Rendering\Thor;
 
-use RasterScanner;
 use Surface\Contracts\Rendering\Framebuffers\Region;
 use Surface\Contracts\Rendering\Rasterization\Edges;
 use Surface\Contracts\Rendering\Rasterization\RasterizeException;
 use Surface\Contracts\Rendering\Rasterization\Scanner;
-use Surface\VelvetGE\Drivers\Rasterization\ScannerRasterizationDriver;
-use Surface\VelvetGE\Rasterize\CLandScanner;
-use Surface\VelvetGE\Rasterize\PHPLandScanner;
+use VelvetGE\Rasterization\ScannerRasterizationDriver;
 
 /**
- * 'thorvg': anti-aliased paths filled by ThorVG through ext-thorvg. Hard edges are VelvetGE's
- * (ext-rasterize's scanner when loaded, else the PHP one), whose pixel rules are exact; ThorVG's
- * aliased mode is experimental and has its own.
+ * 'thorvg': paths filled by ThorVG through ext-thorvg, anti-aliased or, for hard edges, with
+ * ThorVG's own aliased option. Nothing is borrowed from another module.
  */
 class ThorVGRasterizationDriver extends ScannerRasterizationDriver
 {
@@ -32,10 +28,6 @@ class ThorVGRasterizationDriver extends ScannerRasterizationDriver
 
     protected function scanner(Region $clip, Edges $edges): Scanner
     {
-        if ($edges === Edges::HARD) {
-            return class_exists(RasterScanner::class) ? new CLandScanner($clip, $edges) : new PHPLandScanner($clip, $edges);
-        }
-
         return new ThorVGScanner($clip, $edges);
     }
 }

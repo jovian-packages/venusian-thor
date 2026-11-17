@@ -9,20 +9,24 @@ use Surface\Contracts\Rendering\Rasterization\Edges;
 use Surface\Contracts\Rendering\Rasterization\FillRule;
 use Surface\Contracts\Rendering\Rasterization\MaskScanner;
 use Surface\Contracts\Rendering\Rasterization\Scanner;
+use Surface\Contracts\Rendering\Rasterization\ShapeScanner;
 
 /**
- * Fills paths with ThorVG's anti-aliased rasteriser, three ways:
+ * Fills paths, ellipses, rings, round rects and round rings with ThorVG's rasteriser, as ThorVG
+ * geometry (ThorVGShapes), three ways:
  *
  * - fill() draws them straight into a framebuffer's memory, when that memory is 32-bit B G R A or
  *   R G B A rows (ThorVGSurface::colorspace()). ThorVG blends there itself.
- * - mask() answers a path's coverage as bytes, for every other memory: the path is filled in
+ * - mask() answers a shape's coverage as bytes, for every other memory: the path is filled in
  *   opaque white on a cleared scratch buffer and tvg_swcanvas_get_alpha() reads the coverage back
  *   in one call; VelvetGE lands it with the store's paintMasks().
- * - path() run-length encodes that same coverage into spans.
+ * - path(), ellipse(), ring(), roundRect() and roundRing() run-length encode that same coverage
+ *   into spans.
  *
- * The other shapes and hard edges are VelvetGE's, through the completing scanner and the driver.
+ * Both edges are ThorVG's: anti-aliased by default, hard with its aliased option. ThorVG has no
+ * shadow and no one-pixel line; Velvet hands those back undrawn.
  */
-class ThorVGScanner implements DirectScanner, MaskScanner
+class ThorVGScanner implements DirectScanner, MaskScanner, ShapeScanner
 {
     /**
      * Greatest coverage difference from VelvetGE's scanner at any pixel of a simple shape (measured
@@ -53,7 +57,33 @@ class ThorVGScanner implements DirectScanner, MaskScanner
 
     public function path(array $contours, FillRule $rule): string
     {
-        $coverage = $this->coverage($contours, $rule === FillRule::EVEN_ODD);
+        return $this->spans([Scanner::PATH, $contours, $rule === FillRule::EVEN_ODD ? 1 : 0]);
+    }
+
+    public function ellipse(float $cx, float $cy, float $rx, float $ry): string
+    {
+        return $this->spans([Scanner::ELLIPSE, $cx, $cy, $rx, $ry]);
+    }
+
+    public function ring(float $cx, float $cy, float $rx, float $ry, float $stroke): string
+    {
+        return $this->spans([Scanner::RING, $cx, $cy, $rx, $ry, $stroke]);
+    }
+
+    public function roundRect(float $x0, float $y0, float $x1, float $y1, array $radii): string
+    {
+        return $this->spans([Scanner::ROUND_RECT, $x0, $y0, $x1, $y1, $radii]);
+    }
+
+    public function roundRing(float $x0, float $y0, float $x1, float $y1, array $radii, float $inset): string
+    {
+        return $this->spans([Scanner::ROUND_RING, $x0, $y0, $x1, $y1, $radii, $inset]);
+    }
+
+    /** The op's coverage run-length encoded into spans. */
+    private function spans(array $op): string
+    {
+        $coverage = $this->coverage($op);
         if (is_null($coverage)) {
             return '';
         }
@@ -74,13 +104,10 @@ class ThorVGScanner implements DirectScanner, MaskScanner
         return $spans;
     }
 
-    /** @param list<mixed> $op [Scanner::PATH, list of flat contours, 0 non-zero | 1 even-odd] */
+    /** @param list<mixed> $op a PATH, ELLIPSE, RING, ROUND_RECT or ROUND_RING op */
     public function mask(array $op): ?array
     {
-        if (($op[0] ?? null) !== Scanner::PATH) {
-            return null;
-        }
-        $coverage = $this->coverage($op[1], (int) $op[2] === 1);
+        $coverage = $this->coverage($op);
         if (is_null($coverage)) {
             return null;
         }
@@ -95,11 +122,11 @@ class ThorVGScanner implements DirectScanner, MaskScanner
     }
 
     /**
-     * Each path drawn into $memory by ThorVG, inside the clip. The region answered for an op is its
+     * Each shape drawn into $memory by ThorVG, inside the clip. The region answered for an op is its
      * extents inside the clip: every pixel it changed is in there, and a sliver too thin to cover
      * a pixel may make it larger than the pixels changed.
      *
-     * @param  list<list<mixed>>  $ops  PATH ops
+     * @param  list<list<mixed>>  $ops  PATH, ELLIPSE, RING, ROUND_RECT or ROUND_RING ops
      * @param  list<int>  $colours  0xRRGGBBAA
      */
     public function fill(array $ops, array $colours, PixelMemory $memory): array
@@ -109,17 +136,17 @@ class ThorVGScanner implements DirectScanner, MaskScanner
             return array_fill(0, count($ops), null);
         }
 
-        $surface = ThorVGSurface::over($memory);
+        $surface = ThorVGSurface::over($memory, $this->edges === Edges::HARD);
         $touched = [];
         foreach ($ops as $i => $op) {
-            $bounds = ($colours[$i] & 0xFF) === 0 ? null : self::trace($surface->shape(), $op[1]);
+            [$rule, $bounds] = ($colours[$i] & 0xFF) === 0 ? [null, null] : self::shape($surface->shape(), $op);
             $area = $bounds?->intersect($clip);
             if (is_null($area) || $area->isEmpty()) {
                 $touched[] = null;
 
                 continue;
             }
-            $surface->fill((int) $op[2] === 1 ? TVG_FILL_RULE_EVEN_ODD : TVG_FILL_RULE_NON_ZERO, $colours[$i], $clip);
+            $surface->fill($rule, $colours[$i], $clip);
             $touched[] = $area;
         }
 
@@ -127,24 +154,23 @@ class ThorVGScanner implements DirectScanner, MaskScanner
     }
 
     /**
-     * The path's a8 coverage over its extents inside the clip, rows packed, or null when it covers
+     * The op's a8 coverage over its extents inside the clip, rows packed, or null when it covers
      * no pixel there.
      *
-     * @param  list<list<float>>  $contours  flat x, y lists, closed implicitly
+     * @param  list<mixed>  $op
      * @return array{string, Region}|null
      */
-    private function coverage(array $contours, bool $evenOdd): ?array
+    private function coverage(array $op): ?array
     {
-        $bounds = self::extents($contours);
+        $bounds = self::bounds($op);
         $area = $bounds?->intersect($this->clip);
         if (is_null($area) || $area->isEmpty()) {
             return null;
         }
 
-        $rule = $evenOdd ? TVG_FILL_RULE_EVEN_ODD : TVG_FILL_RULE_NON_ZERO;
-        $tile = function (int $x, int $y, int $w, int $h) use ($contours, $rule): string {
-            $surface = ThorVGSurface::scratch($w, $h, $x, $y);
-            self::trace($surface->shape(), $contours);
+        $tile = function (int $x, int $y, int $w, int $h) use ($op): string {
+            $surface = ThorVGSurface::scratch($w, $h, $x, $y, $this->edges === Edges::HARD);
+            [$rule] = self::shape($surface->shape(), $op);
             $surface->fill($rule, 0xFFFFFFFF);
 
             return $surface->alpha();
@@ -169,6 +195,39 @@ class ThorVGScanner implements DirectScanner, MaskScanner
         }
 
         return strspn($a8, "\0") === strlen($a8) ? null : [$a8, $area];
+    }
+
+    /**
+     * The op added to $shape as ThorVG geometry. Answers the fill rule to fill it with and the
+     * pixels its extents reach (null when it reaches none).
+     *
+     * @param  list<mixed>  $op
+     * @return array{int, ?Region}
+     */
+    public static function shape(\Tvg_Paint $shape, array $op): array
+    {
+        return match ($op[0]) {
+            Scanner::PATH => [(int) $op[2] === 1 ? TVG_FILL_RULE_EVEN_ODD : TVG_FILL_RULE_NON_ZERO, self::trace($shape, $op[1])],
+            Scanner::ELLIPSE => ThorVGShapes::ellipse($shape, $op[1], $op[2], $op[3], $op[4]),
+            Scanner::RING => ThorVGShapes::ring($shape, $op[1], $op[2], $op[3], $op[4], $op[5]),
+            Scanner::ROUND_RECT => ThorVGShapes::roundRect($shape, $op[1], $op[2], $op[3], $op[4], $op[5]),
+            Scanner::ROUND_RING => ThorVGShapes::roundRing($shape, $op[1], $op[2], $op[3], $op[4], $op[5], $op[6]),
+        };
+    }
+
+    /**
+     * The pixels the op's extents reach, without drawing it.
+     *
+     * @param  list<mixed>  $op
+     */
+    private static function bounds(array $op): ?Region
+    {
+        return match ($op[0]) {
+            Scanner::PATH => self::extents($op[1]),
+            Scanner::ELLIPSE => ThorVGShapes::box($op[1] - $op[3], $op[2] - $op[4], $op[1] + $op[3], $op[2] + $op[4]),
+            Scanner::RING => ThorVGShapes::box($op[1] - $op[3] - $op[5] / 2, $op[2] - $op[4] - $op[5] / 2, $op[1] + $op[3] + $op[5] / 2, $op[2] + $op[4] + $op[5] / 2),
+            Scanner::ROUND_RECT, Scanner::ROUND_RING => ThorVGShapes::box($op[1], $op[2], $op[3], $op[4]),
+        };
     }
 
     /**

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 use Jovian\Rendering\Thor\ThorVGBrush;
 use Jovian\Rendering\Thor\ThorVGPaintingDriver;
+use Jovian\Rendering\Thor\ThorVGRasterizationDriver;
 use Surface\Contracts\Graphics\StrokeStyle;
 use Surface\Contracts\Rendering\Framebuffers\BitDepth;
 use Surface\Contracts\Rendering\Framebuffers\ChannelOrder;
@@ -18,9 +19,9 @@ use Surface\NutsAndBolts\GradientSpread;
 use Surface\NutsAndBolts\LinearGradient;
 use Surface\NutsAndBolts\Path;
 use Surface\NutsAndBolts\RadialGradient;
-use Surface\VelvetGE\Drivers\Framebuffers\CLandFramebufferDriver;
-use Surface\VelvetGE\Drivers\Painting\PHPLandPaintingDriver;
-use Surface\VelvetGE\Drivers\Rasterization\PHPLandRasterizationDriver;
+use Jovian\Engines\Velvet\Lustrous\Framebuffers\CLandFramebufferDriver;
+use Jovian\Engines\Velvet\Lustrous\Painting\PHPLandPaintbrushDriver;
+use Jovian\Engines\Velvet\Lustrous\Rasterization\PHPLandRasterizationDriver;
 
 /*
  * ThorVG's brush against VelvetGE's native painter. ThorVG draws each shape straight into the
@@ -70,15 +71,27 @@ function thorScene(string $kind, int $seed, int $count = 1): Closure
     };
 }
 
-/** @return array{string, list<Region>} the frame as RGBA8 and its damage */
-function thorFrame(bool $thor, Closure $scene, ChannelOrder $order, Edges $edges): array
+/**
+ * The scene painted on a fresh 32-bit frame. $thor: through 'thorvg' painting (ThorVGBrush, and
+ * ThorVG's rasterizer for what the brush does not take); false: through Lustrous's PHP painter;
+ * 'raster': through VelvetGE's painter with no brush and ThorVG's rasterizer.
+ *
+ * @return array{string, list<Region>, list<array<int, mixed>>} the frame as RGBA8, its damage, and the commands not drawn
+ */
+function thorFrame(bool|string $thor, Closure $scene, ChannelOrder $order, Edges $edges): array
 {
-    $driver = $thor ? new ThorVGPaintingDriver(new PHPLandRasterizationDriver(), true, new \Surface\VelvetGE\Drivers\Recording\PHPLandRecordingDriver()) : new PHPLandPaintingDriver(new PHPLandRasterizationDriver(), true, new \Surface\VelvetGE\Drivers\Recording\PHPLandRecordingDriver());
+    $record = new \Surface\Rendering\Recording\Drivers\PHPLandRecordingDriver();
+    $driver = match ($thor) {
+        true => new ThorVGPaintingDriver(null, true, $record),
+        false => new PHPLandPaintbrushDriver(new PHPLandRasterizationDriver(), true, $record),
+        'raster' => new PHPLandPaintbrushDriver(new ThorVGRasterizationDriver(), true, $record),
+    };
     $target = (new CLandFramebufferDriver())->dirty(new FormatSpec(PixelFormat::ROW_MAJOR, BitDepth::B32, channel_order: $order), THOR_W, THOR_H);
     $target->beginEpoch();
-    $driver->painter($target, $edges)->frame($scene);
+    $painter = $driver->painter($target, $edges);
+    $painter->frame($scene);
 
-    return [$target->flushRegion(new Region(0, 0, THOR_W, THOR_H), FormatSpec::rgba8()), $target->damage()];
+    return [$target->flushRegion(new Region(0, 0, THOR_W, THOR_H), FormatSpec::rgba8()), $target->damage(), $painter->undrawn()];
 }
 
 /** @return array{int, int, int} worst per-byte distance, pixels that differ, pixels beyond the tolerance */
@@ -144,14 +157,15 @@ it('damages every pixel it changes', function (string $kind): void {
     }
 })->with(['fillRect', 'fillEllipse', 'roundRect', 'fill path', 'stroke path', 'linear gradient', 'radial gradient']);
 
-it('leaves hard edges and the commands it does not take to VelvetGE, byte for byte', function (string $kind, Edges $edges): void {
+it('leaves hard edges and the commands it does not take to the painter, which rasterizes them with ThorVG', function (string $kind, Edges $edges): void {
     thorNeeds();
     foreach (range(1, 4) as $seed) {
-        $native = thorFrame(false, thorScene($kind, $seed, 6), ChannelOrder::BGRA, $edges);
+        $raster = thorFrame('raster', thorScene($kind, $seed, 6), ChannelOrder::BGRA, $edges);
         $thor = thorFrame(true, thorScene($kind, $seed, 6), ChannelOrder::BGRA, $edges);
-        expect($thor[0] === $native[0])->toBeTrue()
+        expect($thor[0] === $raster[0])->toBeTrue()
             ->and(array_map(fn (Region $r) => [$r->x, $r->y, $r->width, $r->height], $thor[1]))
-            ->toBe(array_map(fn (Region $r) => [$r->x, $r->y, $r->width, $r->height], $native[1]));
+            ->toBe(array_map(fn (Region $r) => [$r->x, $r->y, $r->width, $r->height], $raster[1]))
+            ->and(count($thor[2]))->toBe(count($raster[2]));
     }
 })->with([
     'hard fill path' => ['fill path', Edges::HARD],
@@ -159,6 +173,17 @@ it('leaves hard edges and the commands it does not take to VelvetGE, byte for by
     'hard gradient' => ['linear gradient', Edges::HARD],
     'shadow' => ['shadow', Edges::ANTIALIASED],
 ]);
+
+it('hands back the shadows ThorVG has no answer for, drawing none of them', function (): void {
+    thorNeeds();
+    foreach (range(1, 4) as $seed) {
+        [$blank] = thorFrame(true, thorScene('shadow', $seed, 0), ChannelOrder::BGRA, Edges::ANTIALIASED);
+        [$frame, , $undrawn] = thorFrame(true, thorScene('shadow', $seed, 6), ChannelOrder::BGRA, Edges::ANTIALIASED);
+        expect($frame === $blank)->toBeTrue()
+            ->and($undrawn)->not->toBeEmpty()
+            ->and(array_unique(array_column($undrawn, 0)))->toBe(['shadow']);
+    }
+});
 
 it('takes only the anti-aliased shapes it draws', function (): void {
     thorNeeds();

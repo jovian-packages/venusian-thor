@@ -8,7 +8,7 @@ use Surface\Contracts\Rendering\Framebuffers\PixelMemory;
 use Surface\Contracts\Rendering\Framebuffers\Region;
 use Surface\Contracts\Rendering\Framebuffers\ScanDirection;
 use Surface\Contracts\Rendering\RenderingException;
-use Surface\VelvetGE\Framebuffers\Layout;
+use VelvetGE\Framebuffers\Layout;
 use Tvg_Canvas;
 use Tvg_Color_Stop;
 use Tvg_Matrix;
@@ -26,6 +26,8 @@ use Tvg_Paint;
  *   it lands within BLEND of VelvetGE on a frame with any alpha. The "S" colorspaces rewrite the
  *   whole buffer after every draw and are not used.
  * - The viewport is the clip; it can only be set while the canvas is synced.
+ * - Hard edges use ThorVG's own aliased option (TVG_ENGINE_OPTION_ALIASED, experimental in
+ *   ThorVG 1.1): a pixel is covered fully or not at all.
  */
 final class ThorVGSurface
 {
@@ -55,12 +57,13 @@ final class ThorVGSurface
         private readonly int $height,
         private readonly int $colorspace,
         private readonly ?object $owner = null,
+        bool $aliased = false,
     ) {
         if (! self::$engine) {
             self::ok(tvg_engine_init(0), 'tvg_engine_init');
             self::$engine = true;
         }
-        $this->canvas = tvg_swcanvas_create(TVG_ENGINE_OPTION_NONE) ?? throw new RenderingException('ThorVG has no software canvas in this build.');
+        $this->canvas = tvg_swcanvas_create($aliased ? TVG_ENGINE_OPTION_NONE | TVG_ENGINE_OPTION_ALIASED : TVG_ENGINE_OPTION_NONE) ?? throw new RenderingException('ThorVG has no software canvas in this build.');
         self::ok(tvg_swcanvas_set_target($this->canvas, $this->target, $pixelsPerRow, $width, $height, $colorspace), 'tvg_swcanvas_set_target');
         $this->shape = tvg_shape_new() ?? throw new RenderingException('ThorVG could not make a shape.');
         self::ok(tvg_canvas_add($this->canvas, $this->shape), 'tvg_canvas_add');
@@ -95,18 +98,21 @@ final class ThorVGSurface
         }
     }
 
-    /** A canvas that draws into $memory in place. colorspace($memory) must not be null. */
-    public static function over(PixelMemory $memory): self
+    /**
+     * A canvas that draws into $memory in place. colorspace($memory) must not be null. $aliased
+     * draws with ThorVG's aliased option: hard edges, every pixel covered fully or not at all.
+     */
+    public static function over(PixelMemory $memory, bool $aliased = false): self
     {
         $colorspace = self::colorspace($memory) ?? throw new RenderingException('ThorVG cannot draw into this memory.');
 
-        return new self($memory->address, intdiv($memory->stride, 4), $memory->width, $memory->height, $colorspace, $memory->owner);
+        return new self($memory->address, intdiv($memory->stride, 4), $memory->width, $memory->height, $colorspace, $memory->owner, $aliased);
     }
 
     /** A cleared $width × $height buffer whose pixel (0, 0) is ($x, $y) of the shapes drawn on it. */
-    public static function scratch(int $width, int $height, int $x, int $y): self
+    public static function scratch(int $width, int $height, int $x, int $y, bool $aliased = false): self
     {
-        $surface = new self(str_repeat("\0", $width * $height * 4), $width, $width, $height, TVG_COLORSPACE_ARGB8888);
+        $surface = new self(str_repeat("\0", $width * $height * 4), $width, $width, $height, TVG_COLORSPACE_ARGB8888, null, $aliased);
         self::ok(tvg_paint_translate($surface->shape, -$x, -$y), 'tvg_paint_translate');
 
         return $surface;
